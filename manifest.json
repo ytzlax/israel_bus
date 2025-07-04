@@ -1,0 +1,10 @@
+{
+  "domain": "israel_bus",
+  "name": "Israel Bus",
+  "version": "1.0.0",
+  "documentation": "https://example.com",
+  "dependencies": [],
+  "codeowners": [],
+  "requirements": [],
+  "config_flow": true
+}
