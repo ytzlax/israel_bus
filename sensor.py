@@ -1,77 +1,94 @@
 import logging
-from datetime import datetime, timedelta, timezone
-import requests
-from dateutil import parser
-import pytz
-
+import aiohttp
+from datetime import timedelta
 from homeassistant.components.sensor import SensorEntity
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, CoordinatorEntity
+from homeassistant.util.dt import parse_datetime
+from .const import DOMAIN, CONF_BUS_LINE, CONF_STATION_NUMBER
 
-DOMAIN = "israel_bus"
 _LOGGER = logging.getLogger(__name__)
+SCAN_INTERVAL = timedelta(hours=3)
+API_KEY = "YL17615191"
 
-async def async_setup_entry(hass, config_entry, async_add_entities):
-    config = hass.data[DOMAIN][config_entry.entry_id]
-    line = config["מס׳ קו"]
-    stop = config["מס׳ תחנה"]
-    agency = config["חברת אוטובוסים"]
-    sensor_friendly_name = config.get("שם סנסור קליט", "") or ""
-    async_add_entities([BusSensor(line, stop, agency, sensor_friendly_name)], update_before_add=True)
+async def async_setup_entry(hass, entry, async_add_entities):
+    bus_line = entry.data[CONF_BUS_LINE]
+    station = entry.data[CONF_STATION_NUMBER]
 
-class BusSensor(SensorEntity):
-    def __init__(self, line, stop, agency, sensor_friendly_name):
-        self._line = line
-        self._stop = stop
-        self._agency = agency
-        self.sensor_friendly_name = sensor_friendly_name
-        self._attr_name = f"Bus {line} at stop {stop}"
-        self._attr_native_value = None
-        self._attr_extra_state_attributes = {}
-        self._attr_device_class = "timestamp"
-
-    def update(self):
+    async def async_update_data():
         try:
-            # נחשב את טווח הזמנים ב-UTC כפי שנדרש על ידי ה-API
-            now_utc = datetime.now(timezone.utc)
-            arrival_from = now_utc.isoformat(timespec="seconds")
-            arrival_to = (now_utc + timedelta(minutes=30)).isoformat(timespec="seconds")
+            url = f"http://moran.mot.gov.il:110/Channels/HTTPChannel/SmQuery/2.8/json?Key={API_KEY}&MonitoringRef={station}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    data = await response.json()
 
-            url = "https://open-bus-stride-api.hasadna.org.il/gtfs_ride_stops/list"
-            params = {
-                "get_count": "false",
-                "arrival_time_from": arrival_from,
-                "arrival_time_to": arrival_to,
-                "gtfs_stop__code": self._stop,
-                "gtfs_route__route_short_name": self._line,
-                "gtfs_route__agency_name": self._agency,
-                "order_by": "id asc"
-            }
+            visits = data.get("Siri", {}).get("ServiceDelivery", {}).get("StopMonitoringDelivery", [])[0].get("MonitoredStopVisit", [])
+            results = []
 
-            response = requests.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
+            for v in visits:
+                journey = v.get("MonitoredVehicleJourney", {})
+                if journey.get("PublishedLineName") != bus_line:
+                    continue
 
-            if not data:
-                self._attr_native_value = None
-                self._attr_extra_state_attributes = {"next_buses": []}
-                return
+                monitored_call = journey.get("MonitoredCall", {})
+                results.append({
+                    "expected": monitored_call.get("ExpectedArrivalTime"),
+                    "aimed": monitored_call.get("AimedArrivalTime"),
+                    "confidence": journey.get("ConfidenceLevel", "unknown")
+                })
 
-            # המרה לשעון ישראל
-            israel_tz = pytz.timezone("Asia/Jerusalem")
-            arrival_times = []
-            for item in data:
-                utc_time = parser.isoparse(item["arrival_time"])
-                local_time = utc_time.astimezone(israel_tz)
-                arrival_times.append(local_time)
+                if len(results) >= 2:
+                    break
 
-            self._attr_native_value = arrival_times[0]
-            self._attr_extra_state_attributes = {
-                "next_buses": arrival_times[1:],
-                "line_number": self._line,
-                "sensor_friendly_name": self.sensor_friendly_name,
-                "stop_name": data[0].get("gtfs_stop__name", "Unknown")
-            }
+            return results
 
         except Exception as e:
-            _LOGGER.error("Error fetching bus data: %s", e)
-            self._attr_native_value = None
-            self._attr_extra_state_attributes = {"next_buses": []}
+            _LOGGER.error(f"Error fetching or parsing bus data: {e}")
+            return []
+
+    coordinator = DataUpdateCoordinator(
+        hass,
+        _LOGGER,
+        name="israel_bus",
+        update_method=async_update_data,
+        update_interval=SCAN_INTERVAL,
+    )
+
+    await coordinator.async_config_entry_first_refresh()
+
+    sensors = [
+        BusArrivalSensor(coordinator, entry.entry_id, bus_line, station, 0),
+        BusArrivalSensor(coordinator, entry.entry_id, bus_line, station, 1),
+    ]
+
+    async_add_entities(sensors)
+
+
+class BusArrivalSensor(CoordinatorEntity, SensorEntity):
+    def __init__(self, coordinator, config_entry_id, bus_line, station, index):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{config_entry_id}_{index}"
+        self._attr_name = f"Bus {bus_line}-{station}-{index + 1}"
+        self._attr_device_class = "timestamp"
+        self.index = index
+        self._attr_extra_state_attributes = {}
+
+    @property
+    def native_value(self):
+        try:
+            record = self.coordinator.data[self.index]
+            is_live = record.get("confidence") == "probablyReliable"
+            self._attr_extra_state_attributes["is_live"] = is_live
+
+            raw_time = record.get("expected" if is_live else "aimed")
+            return parse_datetime(raw_time)
+        except (IndexError, TypeError, ValueError):
+            self._attr_extra_state_attributes["is_live"] = False
+            return None
+
+    @property
+    def available(self) -> bool:
+        return (
+            self.coordinator.last_update_success
+            and self.coordinator.data is not None
+            and len(self.coordinator.data) > self.index
+        )
