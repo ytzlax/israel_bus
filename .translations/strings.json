@@ -1,0 +1,14 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Israel Bus Sensor",
+        "description": "Configure your desired bus line and station",
+        "data": {
+          "bus_line": "Bus Line",
+          "station_number": "Station Number"
+        }
+      }
+    }
+  }
+}
